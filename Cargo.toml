@@ -12,32 +12,21 @@ libafl_bolts = "0.15.4"
 
 # Wayland session replayer.
 #
-# Used (via WlRepeaterFuzzer placeholder) to drive a live compositor with
-# mutated Wayland wire streams.  The public API surface consumed by the fuzzer:
+# Used by the live harness to drive a compositor with mutated Wayland wire
+# streams. The public API surface consumed by the fuzzer:
 #
 #   wl_repeater::protocol::Protocol          – load Wayland XML descriptors
 #   wl_repeater::ir::IrReader                – deserialise .wlir trace files
 #   wl_repeater::repeater::Repeater          – replay C→S messages against a compositor
 #   wl_repeater::message::WaylandMessage     – canonical per-message type
 #
-# The crate is linked now so the dependency graph is correct; the harness
-# calls into it are guarded by TODO stubs until the compositor orchestration
-# layer (M3) is in place.
+# Replay runs in-process today; future compositor supervision and
+# target-side coverage work will change execution boundaries, not this
+# dependency relationship.
 wl_repeater  = { path = "../wl_repeater" }
 
-# ── Build profiles ────────────────────────────────────────────────────────────
-
-[profile.dev]
-# Abort on panic so LibAFL's in-process crash detection works correctly even
-# in debug builds (unwinding would hide crashes from the executor).
-panic = "abort"
-
-[profile.release]
-panic        = "abort"
-lto          = true
-codegen-units = 1
-opt-level    = 3
-debug        = true   # keep symbols for crash triage
+[dev-dependencies]
+tempfile = "3"
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 
