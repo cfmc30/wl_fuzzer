@@ -1,0 +1,47 @@
+[package]
+name = "fuzzer"
+version = "0.1.0"
+edition = "2024"
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+[dependencies]
+# LibAFL fuzzing engine and bolt-on utilities.
+libafl       = "0.15.4"
+libafl_bolts = "0.15.4"
+
+# Wayland session replayer.
+#
+# Used (via WlRepeaterFuzzer placeholder) to drive a live compositor with
+# mutated Wayland wire streams.  The public API surface consumed by the fuzzer:
+#
+#   wl_repeater::protocol::Protocol          – load Wayland XML descriptors
+#   wl_repeater::ir::IrReader                – deserialise .wlir trace files
+#   wl_repeater::repeater::Repeater          – replay C→S messages against a compositor
+#   wl_repeater::message::WaylandMessage     – canonical per-message type
+#
+# The crate is linked now so the dependency graph is correct; the harness
+# calls into it are guarded by TODO stubs until the compositor orchestration
+# layer (M3) is in place.
+wl_repeater  = { path = "../wl_repeater" }
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+
+[profile.dev]
+# Abort on panic so LibAFL's in-process crash detection works correctly even
+# in debug builds (unwinding would hide crashes from the executor).
+panic = "abort"
+
+[profile.release]
+panic        = "abort"
+lto          = true
+codegen-units = 1
+opt-level    = 3
+debug        = true   # keep symbols for crash triage
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+
+[features]
+# Placeholder feature retained from the original scaffold; remove or repurpose
+# once real feature gating is needed (e.g. "shmem_coverage", "fork_executor").
+panic = []
