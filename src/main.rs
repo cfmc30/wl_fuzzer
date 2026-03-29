@@ -46,6 +46,8 @@
 extern crate libafl;
 extern crate libafl_bolts;
 
+mod ir_mutator;
+
 use std::{
     error::Error,
     fs, io,
@@ -60,7 +62,7 @@ use libafl::{
     feedbacks::{CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasTargetBytes},
-    monitors::SimpleMonitor,
+    monitors::{SimpleMonitor, tui::TuiMonitor},
     mutators::{havoc_mutations, scheduled::HavocScheduledMutator},
     observers::StdMapObserver,
     schedulers::QueueScheduler,
@@ -136,7 +138,7 @@ impl Default for WlRepeaterConfig {
             display: "wayland-0".to_owned(),
             protocol_dirs: vec![PathBuf::from("protocol")],
             verbose: false,
-            server_wait_timeout_ms: 500,
+            server_wait_timeout_ms: 100,
         }
     }
 }
@@ -690,7 +692,12 @@ fn main() -> ExitCode {
     // ── Monitor ───────────────────────────────────────────────────────────────
     //
     // Prints fuzzer statistics (executions/s, corpus size, crashes) to stdout.
-    let mon = SimpleMonitor::new(|s| println!("{s}"));
+    //     let mon = SimpleMonitor::new(|s| println!("{s}"));
+
+    let mon = TuiMonitor::builder()
+        .title("Baby Fuzzer")
+        .enhanced_graphics(false)
+        .build();
 
     // ── Event manager ─────────────────────────────────────────────────────────
     //
@@ -800,8 +807,11 @@ fn main() -> ExitCode {
     // the Wayland wire header (object_id, opcode, size) so mutations produce
     // valid enough messages to reach deeper compositor logic rather than being
     // rejected at the socket-parsing layer.
-    let mutator = HavocScheduledMutator::new(havoc_mutations());
+    // let mutator = HavocScheduledMutator::new(havoc_mutations());
+    let mutator = ir_mutator::IRMutator;
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+    // let mut stages = tuple_list!();
+    // let mut stages = ();
 
     // ── Fuzzing loop ──────────────────────────────────────────────────────────
     fuzzer

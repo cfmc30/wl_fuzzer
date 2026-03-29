@@ -7,7 +7,7 @@ edition = "2024"
 
 [dependencies]
 # LibAFL fuzzing engine and bolt-on utilities.
-libafl       = "0.15.4"
+libafl       = {version = "0.15.4",  features = ["tui_monitor"] }
 libafl_bolts = "0.15.4"
 
 # Wayland session replayer.
@@ -34,3 +34,4 @@ tempfile = "3"
 # Placeholder feature retained from the original scaffold; remove or repurpose
 # once real feature gating is needed (e.g. "shmem_coverage", "fork_executor").
 panic = []
+tui = []
