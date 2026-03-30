@@ -70,7 +70,7 @@ use libafl::{
     state::{HasCorpus, StdState},
 };
 use libafl_bolts::{AsSlice, rands::StdRand, tuples::tuple_list};
-use wl_repeater::{ir::IrReader, protocol::Protocol, repeater::Repeater};
+use wl_repeater::{ReplaySummary, ir::IrReader, protocol::Protocol, repeater::Repeater};
 
 // ── Coverage signal map ───────────────────────────────────────────────────────
 
@@ -243,20 +243,19 @@ fn build_repeater(config: &WlRepeaterConfig, start_time_us: u64) -> io::Result<R
         config.verbose,
         false,
         false,
-        false,
         config.server_wait_timeout_ms,
         start_time_us,
         protocol,
     )
 }
 
-fn classify_replay_result(result: io::Result<()>) -> FuzzOutcome {
+fn classify_replay_result(result: io::Result<ReplaySummary>) -> FuzzOutcome {
     // TODO(boundary): replay errors are only a rough crash proxy right now.
     // The next milestone adds compositor supervision and crash classification
     // so this mapping can separate compositor exits/hangs from replay-layer
     // failures that do not represent a target crash.
     match result {
-        Ok(()) => FuzzOutcome::Ok,
+        Ok(_) => FuzzOutcome::Ok,
         Err(err)
             if matches!(
                 err.kind(),
@@ -544,7 +543,13 @@ mod tests {
 
     #[test]
     fn classify_replay_result_returns_ok_on_success() {
-        assert!(matches!(classify_replay_result(Ok(())), FuzzOutcome::Ok));
+        assert!(matches!(
+            classify_replay_result(Ok(ReplaySummary {
+                replayed: 0,
+                drained: 0
+            })),
+            FuzzOutcome::Ok
+        ));
     }
 
     #[test]
