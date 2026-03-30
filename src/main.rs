@@ -695,7 +695,7 @@ fn main() -> ExitCode {
     //     let mon = SimpleMonitor::new(|s| println!("{s}"));
 
     let mon = TuiMonitor::builder()
-        .title("Baby Fuzzer")
+        .title("Wayland Fuzzer")
         .enhanced_graphics(false)
         .build();
 
