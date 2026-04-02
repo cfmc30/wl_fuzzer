@@ -4,13 +4,12 @@
 //!
 //! ```text
 //!  LibAFL mutation engine
-//!    └─► BytesInput  (complete `.wlir` recording bytes)
+//!    └─► WlirInput  (parsed `.wlir` session in memory)
 //!          └─► harness()
 //!                └─► WlRepeaterFuzzer::fuzz_session()
-//!                      ├─► wl_repeater::ir::IrReader::from_bytes(recording_bytes)
 //!                      ├─► local protocol loader for Wayland XML descriptors
 //!                      ├─► wl_repeater::repeater::Repeater::new(&display, …)
-//!                      └─► Repeater::run(&mut reader)   // replays a `.wlir` recording
+//!                      └─► Repeater::run_from_messages(messages)
 //!                │
 //!                └─► SIGNALS coverage map   (temporary WLIR message-pair heuristic)
 //!                      └─► StdMapObserver
@@ -42,11 +41,20 @@
 //!    distinguish malformed inputs from real compositor exits or hangs.
 //! 2. **After that:** shared-memory coverage from an instrumented compositor,
 //!    replacing the local `SIGNALS` heuristic with target-side coverage.
+//!
+//! # Explicit Deferred Boundaries (`TODO(boundary)`)
+//!
+//! - argument-aware mutation
+//! - protocol-aware message synthesis
+//! - connection reuse / repeater reset
+//! - replay duration and message-count caps
+//! - smarter ownership to avoid cloning large message vectors
 
 extern crate libafl;
 extern crate libafl_bolts;
 
-mod ir_mutator;
+mod wlir_input;
+mod wlir_mutator;
 
 use std::{
     error::Error,
@@ -61,16 +69,16 @@ use libafl::{
     executors::{ExitKind, inprocess::InProcessExecutor},
     feedbacks::{CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
-    inputs::{BytesInput, HasTargetBytes},
-    monitors::{SimpleMonitor, tui::TuiMonitor},
-    mutators::{havoc_mutations, scheduled::HavocScheduledMutator},
+    monitors::tui::TuiMonitor,
     observers::StdMapObserver,
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::{HasCorpus, StdState},
 };
-use libafl_bolts::{AsSlice, rands::StdRand, tuples::tuple_list};
-use wl_repeater::{ReplaySummary, ir::IrReader, protocol::Protocol, repeater::Repeater};
+use libafl_bolts::{rands::StdRand, tuples::tuple_list};
+use wl_repeater::{ReplaySummary, message::WaylandMessage, protocol::Protocol, repeater::Repeater};
+
+use crate::{wlir_input::WlirInput, wlir_mutator::WlirMutator};
 
 // ── Coverage signal map ───────────────────────────────────────────────────────
 
@@ -171,10 +179,9 @@ pub enum FuzzOutcome {
 /// Wrapper around `wl_repeater::repeater::Repeater` for use inside a LibAFL
 /// in-process harness.
 ///
-/// The fuzzer input model is a complete `.wlir` recording. `fuzz_session`
-/// parses the bytes with `IrReader::from_bytes`, constructs a `Repeater`
-/// against the configured compositor socket, and classifies `Repeater::run`
-/// results into `FuzzOutcome` values for LibAFL.
+/// The fuzzer input model is `WlirInput` (`header + messages`). `fuzz_session`
+/// replays `input.messages` via `Repeater::run_from_messages`, then classifies
+/// replay results into `FuzzOutcome` values for LibAFL.
 pub struct WlRepeaterFuzzer {
     config: WlRepeaterConfig,
 }
@@ -185,31 +192,15 @@ impl WlRepeaterFuzzer {
         WlRepeaterFuzzer { config }
     }
 
-    /// Run one fuzzing session with `input` as a complete `.wlir`
-    /// recording/container.
+    /// Run one fuzzing session with `input` as a structured WLIR session.
     ///
-    /// Malformed `.wlir` inputs are expected during mutation and therefore map
-    /// to `FuzzOutcome::SetupFailed` rather than `Crash`.
-    pub fn fuzz_session(&self, input: &[u8]) -> FuzzOutcome {
-        let coverage_pairs = match extract_coverage_pairs_from_wlir(input) {
-            Ok(pairs) => pairs,
-            Err(err) => {
-                return FuzzOutcome::SetupFailed {
-                    reason: format!("failed to extract WLIR coverage pairs: {err}"),
-                };
-            }
-        };
+    /// Malformed `.wlir` persistence bytes are expected during mutation and
+    /// parse/interop failures map to `FuzzOutcome::SetupFailed` rather than `Crash`.
 
-        let mut reader = match parse_input_as_wlir(input) {
-            Ok(reader) => reader,
-            Err(err) => {
-                return FuzzOutcome::SetupFailed {
-                    reason: format!("failed to parse .wlir input: {err}"),
-                };
-            }
-        };
+    pub fn fuzz_session(&self, input: &WlirInput) -> FuzzOutcome {
+        let coverage_pairs = extract_coverage_pairs_from_messages(&input.messages);
 
-        let mut repeater = match build_repeater(&self.config, reader.header.start_time_us) {
+        let mut repeater = match build_repeater(&self.config, input.header.start_time_us) {
             Ok(repeater) => repeater,
             Err(err) => {
                 return FuzzOutcome::SetupFailed {
@@ -218,19 +209,9 @@ impl WlRepeaterFuzzer {
             }
         };
 
-        let outcome = classify_replay_result(repeater.run(&mut reader));
+        let outcome = classify_replay_result(repeater.run_from_messages(input.messages.clone()));
         record_coverage_pairs(&eligible_coverage_pairs(&outcome, &coverage_pairs));
         outcome
-    }
-}
-
-pub(crate) fn parse_input_as_wlir(input: &[u8]) -> io::Result<IrReader> {
-    match IrReader::from_bytes(input.to_vec()) {
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("truncated .wlir input: {err}"),
-        )),
-        result => result,
     }
 }
 
@@ -272,15 +253,11 @@ fn classify_replay_result(result: io::Result<ReplaySummary>) -> FuzzOutcome {
     }
 }
 
-fn extract_coverage_pairs_from_wlir(input: &[u8]) -> io::Result<Vec<(u32, u16)>> {
-    let mut reader = parse_input_as_wlir(input)?;
-    let mut pairs = Vec::new();
-
-    while let Some(message) = reader.next_message()? {
-        pairs.push((message.object_id, message.opcode));
-    }
-
-    Ok(pairs)
+fn extract_coverage_pairs_from_messages(messages: &[WaylandMessage]) -> Vec<(u32, u16)> {
+    messages
+        .iter()
+        .map(|message| (message.object_id, message.opcode))
+        .collect()
 }
 
 fn eligible_coverage_pairs(outcome: &FuzzOutcome, pairs: &[(u32, u16)]) -> Vec<(u32, u16)> {
@@ -323,7 +300,7 @@ fn coverage_bucket(object_id: u32, opcode: u16) -> usize {
 }
 
 /// Load seed recordings from a directory containing `.wlir` files.
-pub(crate) fn load_seed_recordings(dir: &Path) -> io::Result<Vec<BytesInput>> {
+pub(crate) fn load_seed_recordings(dir: &Path) -> io::Result<Vec<WlirInput>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -336,7 +313,12 @@ pub(crate) fn load_seed_recordings(dir: &Path) -> io::Result<Vec<BytesInput>> {
         }
         let bytes = fs::read(&path)?;
         if !bytes.is_empty() {
-            seeds.push(BytesInput::new(bytes));
+            seeds.push(WlirInput::from_bytes(&bytes).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse seed {}: {err}", path.display()),
+                )
+            })?);
         }
     }
 
@@ -351,7 +333,7 @@ pub(crate) fn default_corpus_dir() -> PathBuf {
 ///
 /// Startup requires real `.wlir` recordings from `corpus/`. If that directory
 /// has no usable `.wlir` entries, startup fails before the fuzz loop begins.
-pub(crate) fn select_startup_seeds(corpus_dir: &Path) -> io::Result<Vec<BytesInput>> {
+pub(crate) fn select_startup_seeds(corpus_dir: &Path) -> io::Result<Vec<WlirInput>> {
     let seeds = load_seed_recordings(corpus_dir)?;
     if !seeds.is_empty() {
         return Ok(seeds);
@@ -365,7 +347,7 @@ pub(crate) fn select_startup_seeds(corpus_dir: &Path) -> io::Result<Vec<BytesInp
 
 pub(crate) fn install_startup_seeds<C>(corpus: &mut C, corpus_dir: &Path) -> io::Result<()>
 where
-    C: Corpus<BytesInput>,
+    C: Corpus<WlirInput>,
 {
     for seed in select_startup_seeds(corpus_dir)? {
         corpus.add(Testcase::new(seed)).map_err(|err| {
@@ -462,9 +444,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_coverage_pairs_from_wlir_reads_message_records() {
-        let bytes = minimal_wlir_with_message(7, 3);
-        let parsed = extract_coverage_pairs_from_wlir(&bytes).unwrap();
+    fn extract_coverage_pairs_from_messages_reads_message_records() {
+        let input = WlirInput::from_bytes(&minimal_wlir_with_message(7, 3)).unwrap();
+        let parsed = extract_coverage_pairs_from_messages(&input.messages);
         assert_eq!(parsed, vec![(7, 3)]);
     }
 
@@ -493,23 +475,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_as_wlir_rejects_non_wlir_bytes() {
-        let err = match parse_input_as_wlir(b"not-wlir") {
-            Ok(_) => panic!("expected invalid WLIR bytes to be rejected"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    fn wlir_input_rejects_non_wlir_bytes() {
+        let err = WlirInput::from_bytes(b"not-wlir").unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]
-    fn parse_input_as_wlir_accepts_valid_wlir_header() {
+    fn wlir_input_accepts_valid_wlir_header() {
         let mut bytes = vec![0u8; 24];
         bytes[0..4].copy_from_slice(&0x574C_4952u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
         bytes[8..16].copy_from_slice(&1234u64.to_le_bytes());
 
-        let reader = parse_input_as_wlir(&bytes).unwrap();
-        assert_eq!(reader.header.start_time_us, 1234);
+        let input = WlirInput::from_bytes(&bytes).unwrap();
+        assert_eq!(input.header.start_time_us, 1234);
     }
 
     #[test]
@@ -575,6 +557,7 @@ mod tests {
 
         let seeds = load_seed_recordings(tmp.path()).unwrap();
         assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].messages.len(), 1);
     }
 
     #[test]
@@ -659,9 +642,9 @@ mod tests {
 ///
 /// One call to `harness` constitutes one complete fuzzing iteration:
 ///
-/// 1. Interprets `input` as a complete `.wlir` recording.
-/// 2. Forwards them to `WlRepeaterFuzzer::fuzz_session`, which parses the
-///    recording and replays it through `wl_repeater`.
+/// 1. Interprets `input` as a structured `WlirInput` session.
+/// 2. Forwards it to `WlRepeaterFuzzer::fuzz_session`, which replays
+///    pre-parsed messages through `wl_repeater`.
 /// 3. Maps `FuzzOutcome` to a `ExitKind` for LibAFL:
 ///    - `Ok`          → `ExitKind::Ok`
 ///    - `Crash`       → `ExitKind::Crash`   (input saved to crash corpus)
@@ -674,17 +657,14 @@ mod tests {
 /// for the current boundary-marking milestone, but the harness should
 /// eventually move to subprocess or forked execution once compositor
 /// supervision and restart logic exist.
-fn harness(input: &BytesInput) -> ExitKind {
-    let target = input.target_bytes();
-    let data = target.as_slice();
-
+fn harness(input: &WlirInput) -> ExitKind {
     // TODO(boundary): `InProcessExecutor` only isolates the harness. It does
     // not supervise or restart the compositor, so this in-process harness is a
     // temporary execution model until the replay path moves behind a
     // subprocess/forked boundary.
     let fuzzer = WlRepeaterFuzzer::new(WlRepeaterConfig::default());
 
-    match fuzzer.fuzz_session(data) {
+    match fuzzer.fuzz_session(input) {
         FuzzOutcome::Ok => ExitKind::Ok,
         FuzzOutcome::Crash { .. } => ExitKind::Crash,
         FuzzOutcome::SetupFailed { .. } => ExitKind::Ok,
@@ -756,7 +736,7 @@ fn main() -> ExitCode {
     let mut state = StdState::new(
         StdRand::new(),
         // Evolving corpus: kept in memory for maximum throughput.
-        InMemoryCorpus::new(),
+        InMemoryCorpus::<WlirInput>::new(),
         // Crash corpus: written to disk so inputs survive a fuzzer restart.
         OnDiskCorpus::new(PathBuf::from("./crashes")).unwrap(),
         &mut feedback,
@@ -803,17 +783,13 @@ fn main() -> ExitCode {
 
     // ── Mutation stage ────────────────────────────────────────────────────────
     //
-    // `HavocScheduledMutator` applies a random sequence of byte-level
-    // mutations (flips, insertions, deletions, splicing) drawn from the
-    // standard `havoc_mutations()` set.  The `StdMutationalStage` wraps it so
-    // that the fuzzer applies N mutations per queue entry each round.
+    // `WlirMutator` performs first-pass structural-safe message mutations
+    // (remove, duplicate, swap-adjacent, bounded timestamp/object/opcode edits)
+    // while preserving payload semantics for `wire_data[8..]` and FD content.
     //
-    // TODO(later): add a protocol-aware `WaylandMessageMutator` that respects
-    // the Wayland wire header (object_id, opcode, size) so mutations produce
-    // valid enough messages to reach deeper compositor logic rather than being
-    // rejected at the socket-parsing layer.
-    // let mutator = HavocScheduledMutator::new(havoc_mutations());
-    let mutator = ir_mutator::IRMutator;
+    // TODO(later): add protocol-semantic argument-aware mutations once message
+    // decoding/validation hooks are integrated into the mutator.
+    let mutator = WlirMutator;
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
     // let mut stages = tuple_list!();
     // let mut stages = ();
