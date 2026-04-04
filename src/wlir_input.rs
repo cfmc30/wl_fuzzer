@@ -6,10 +6,10 @@ use std::{
 };
 
 use libafl::inputs::{HasTargetBytes, Input};
-use libafl_bolts::{HasLen, ownedref::OwnedSlice};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use libafl_bolts::{ownedref::OwnedSlice, HasLen};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use wl_repeater::{
-    ir::{IrFileHeader, IrReader, decode_wlir, encode_wlir},
+    ir::{decode_wlir, encode_wlir, IrFileHeader, IrReader},
     message::WaylandMessage,
 };
 
@@ -111,7 +111,7 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
     use wl_repeater::{
-        ir::{IrFileHeader, decode_wlir, encode_wlir},
+        ir::{decode_wlir, encode_wlir, IrFileHeader},
         message::{Direction, FdRecord, FdType, FdUpdateRecord},
     };
 

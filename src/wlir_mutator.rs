@@ -1,12 +1,12 @@
 use std::{borrow::Cow, num::NonZeroUsize};
 
 use libafl::{
-    Error,
     corpus::CorpusId,
     mutators::{MutationResult, Mutator},
     state::HasRand,
+    Error,
 };
-use libafl_bolts::{Named, rands::Rand};
+use libafl_bolts::{rands::Rand, Named};
 use wl_repeater::message::WaylandMessage;
 
 use crate::wlir_input::WlirInput;

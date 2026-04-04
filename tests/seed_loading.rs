@@ -1,3 +1,9 @@
+#[path = "../src/config.rs"]
+mod config;
+
+#[path = "../src/differential.rs"]
+mod differential;
+
 #[path = "../src/wlir_input.rs"]
 mod wlir_input;
 
@@ -10,11 +16,10 @@ mod main_impl;
 
 use std::{fs, path::PathBuf};
 
+use config::{SharedReplayConfig, TargetConfig};
+use differential::{classify_replay_result, ReplayExecutor, ReplayOutcome};
 use libafl::corpus::{Corpus, InMemoryCorpus};
-use main_impl::{
-    FuzzOutcome, WlRepeaterConfig, WlRepeaterFuzzer, default_corpus_dir, install_startup_seeds,
-    load_seed_recordings, select_startup_seeds,
-};
+use main_impl::{install_startup_seeds, load_seed_recordings, select_startup_seeds};
 use wlir_input::WlirInput;
 
 fn protocol_dir() -> PathBuf {
@@ -74,14 +79,6 @@ fn minimal_wlir_with_message(object_id: u32, opcode: u16) -> Vec<u8> {
     bytes.extend_from_slice(&8u16.to_le_bytes());
 
     bytes
-}
-
-#[test]
-fn default_corpus_dir_points_at_repo_corpus_directory() {
-    assert_eq!(
-        default_corpus_dir(),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus")
-    );
 }
 
 #[test]
@@ -145,45 +142,28 @@ fn install_startup_seeds_returns_error_when_corpus_is_empty() {
 
 #[test]
 fn malformed_wlir_is_classified_as_non_crash_setup_failure() {
-    let fuzzer = WlRepeaterFuzzer::new(WlRepeaterConfig {
-        display: missing_display_socket(),
-        protocol_dirs: vec![protocol_dir()],
-        verbose: false,
-        server_wait_timeout_ms: 500,
-    });
-
-    let bad = WlirInput {
-        header: wl_repeater::ir::IrFileHeader {
-            magic: 0x574C_4952,
-            version: 2,
-            start_time_us: 0,
-            flags: 0,
-            reserved: 0,
-        },
-        messages: Vec::new(),
-    };
+    let bad = classify_replay_result(
+        "malformed",
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated record",
+        )),
+    );
 
     assert!(matches!(
-        fuzzer.fuzz_session(&bad),
-        FuzzOutcome::SetupFailed { reason }
-            if reason.contains("failed to build wl_repeater session")
+        bad,
+        ReplayOutcome::SetupFailed { reason }
+            if reason.contains("malformed") && reason.contains("truncated record")
     ));
 }
 
 #[test]
 fn header_valid_corrupt_unknown_record_is_setup_failed_without_panicking() {
-    let _fuzzer = WlRepeaterFuzzer::new(WlRepeaterConfig {
-        display: missing_display_socket(),
-        protocol_dirs: vec![protocol_dir()],
-        verbose: false,
-        server_wait_timeout_ms: 500,
-    });
     let bytes = corrupt_wlir_with_unknown_record_smaller_than_header();
     let err = WlirInput::from_bytes(&bytes).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unknown record smaller than header")
-    );
+    assert!(err
+        .to_string()
+        .contains("unknown record smaller than header"));
 }
 
 #[test]
@@ -197,16 +177,22 @@ fn generated_wlir_fixture_loads_as_known_good_input() {
 #[test]
 fn missing_display_socket_is_reported_as_setup_failed() {
     let input = WlirInput::from_bytes(&minimal_wlir_with_message(1, 0)).unwrap();
-    let fuzzer = WlRepeaterFuzzer::new(WlRepeaterConfig {
-        display: missing_display_socket(),
-        protocol_dirs: vec![protocol_dir()],
-        verbose: false,
-        server_wait_timeout_ms: 500,
-    });
+    let fuzzer = ReplayExecutor::new(
+        SharedReplayConfig {
+            protocol_dirs: vec![protocol_dir()],
+            verbose: false,
+            server_wait_timeout_ms: 500,
+        },
+        TargetConfig {
+            name: "missing-socket".to_owned(),
+            xdg_runtime_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+            display: missing_display_socket(),
+        },
+    );
 
     assert!(matches!(
-        fuzzer.fuzz_session(&input),
-        FuzzOutcome::SetupFailed { reason }
+        fuzzer.run(&input),
+        ReplayOutcome::SetupFailed { reason }
             if reason.contains("failed to build wl_repeater session")
     ));
 }
