@@ -32,7 +32,6 @@ where
         let mut available_ops = vec![
             MutationOp::Duplicate,
             MutationOp::TimestampJitter,
-            MutationOp::EditObjectIdOrOpcode,
         ];
 
         if input.messages.len() > 1 {
@@ -54,7 +53,6 @@ where
             MutationOp::Duplicate => duplicate_one_message(state, input),
             MutationOp::SwapAdjacent => swap_adjacent_messages(state, input),
             MutationOp::TimestampJitter => jitter_timestamp_bounded(state, input),
-            MutationOp::EditObjectIdOrOpcode => edit_object_id_or_opcode_bounded(state, input),
         };
 
         Ok(result)
@@ -71,7 +69,6 @@ enum MutationOp {
     Duplicate,
     SwapAdjacent,
     TimestampJitter,
-    EditObjectIdOrOpcode,
 }
 
 pub(crate) fn remove_one_message<S: HasRand>(
@@ -143,44 +140,6 @@ pub(crate) fn jitter_timestamp_bounded<S: HasRand>(
         message.timestamp_us = message.timestamp_us.saturating_sub(delta);
     }
 
-    MutationResult::Mutated
-}
-
-pub(crate) fn edit_object_id_or_opcode_bounded<S: HasRand>(
-    state: &mut S,
-    input: &mut WlirInput,
-) -> MutationResult {
-    if input.messages.is_empty() {
-        return MutationResult::Skipped;
-    }
-
-    let index = state
-        .rand_mut()
-        .below(NonZeroUsize::new(input.messages.len()).unwrap());
-    let message = &mut input.messages[index];
-
-    if state.rand_mut().coinflip(0.5) {
-        let delta = state.rand_mut().between(1, MAX_OBJECT_ID_DELTA as usize) as u32;
-        let new_object_id = if state.rand_mut().coinflip(0.5) {
-            message.object_id.saturating_add(delta)
-        } else {
-            message.object_id.saturating_sub(delta)
-        }
-        .max(1);
-
-        message.object_id = new_object_id;
-    } else {
-        let delta = state.rand_mut().between(1, MAX_OPCODE_DELTA as usize) as u16;
-        let new_opcode = if state.rand_mut().coinflip(0.5) {
-            message.opcode.saturating_add(delta)
-        } else {
-            message.opcode.saturating_sub(delta)
-        };
-
-        message.opcode = new_opcode;
-    }
-
-    sync_wire_header(message);
     MutationResult::Mutated
 }
 
@@ -357,29 +316,6 @@ mod tests {
             if a != b {
                 changed += 1;
                 assert!(a.abs_diff(*b) <= MAX_TIMESTAMP_JITTER_US);
-            }
-        }
-        assert_eq!(changed, 1);
-    }
-
-    #[test]
-    fn object_id_or_opcode_edit_is_bounded_and_keeps_payload_bytes() {
-        let mut input = mk_input();
-        let mut state = mk_state(0x4242);
-        let before = input.messages.clone();
-
-        let result = edit_object_id_or_opcode_bounded(&mut state, &mut input);
-
-        assert!(matches!(result, MutationResult::Mutated));
-
-        let mut changed = 0usize;
-        for (old, new) in before.iter().zip(input.messages.iter()) {
-            if old.object_id != new.object_id || old.opcode != new.opcode {
-                changed += 1;
-                assert!(old.object_id.abs_diff(new.object_id) <= MAX_OBJECT_ID_DELTA);
-                assert!(old.opcode.abs_diff(new.opcode) <= MAX_OPCODE_DELTA);
-                assert_eq!(&old.wire_data[8..], &new.wire_data[8..]);
-                assert_eq!(old.fds[0].content, new.fds[0].content);
             }
         }
         assert_eq!(changed, 1);
