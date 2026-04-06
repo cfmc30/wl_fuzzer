@@ -1,4 +1,8 @@
-use std::{borrow::Cow, num::NonZeroUsize};
+use std::{
+    borrow::Cow,
+    num::NonZeroUsize,
+    panic::{catch_unwind, AssertUnwindSafe},
+};
 
 use libafl::{
     corpus::CorpusId,
@@ -170,6 +174,10 @@ pub(crate) fn substitute_receiver_same_interface<S: HasRand>(
     input: &mut WlirInput,
     protocol: &Protocol,
 ) -> MutationResult {
+    if has_any_fd_payload(input) {
+        return MutationResult::Skipped;
+    }
+
     let mut session = SymbolicSession::import(&input.header, &input.messages, protocol);
     let semantic_indexes: Vec<_> = session
         .messages
@@ -201,7 +209,10 @@ pub(crate) fn substitute_receiver_same_interface<S: HasRand>(
             .rand_mut()
             .below(NonZeroUsize::new(alternatives.len()).unwrap());
         session.messages[index].receiver = alternatives[choice];
-        input.messages = session.lower(protocol);
+        let Some(lowered) = try_lower_session(&session, protocol) else {
+            return MutationResult::Skipped;
+        };
+        input.messages = lowered;
         return MutationResult::Mutated;
     }
 
@@ -213,14 +224,35 @@ pub(crate) fn substitute_object_arg_same_interface<S: HasRand>(
     input: &mut WlirInput,
     protocol: &Protocol,
 ) -> MutationResult {
+    if has_any_fd_payload(input) {
+        return MutationResult::Skipped;
+    }
+
     let mut session = SymbolicSession::import(&input.header, &input.messages, protocol);
 
     let result = substitute_object_arg_same_interface_in_session(state, &mut session);
     if matches!(result, MutationResult::Mutated) {
-        input.messages = session.lower(protocol);
+        let Some(lowered) = try_lower_session(&session, protocol) else {
+            return MutationResult::Skipped;
+        };
+        input.messages = lowered;
     }
 
     result
+}
+
+fn has_any_fd_payload(input: &WlirInput) -> bool {
+    input
+        .messages
+        .iter()
+        .any(|message| !message.fds.is_empty() || !message.fd_updates.is_empty())
+}
+
+fn try_lower_session(
+    session: &SymbolicSession,
+    protocol: &Protocol,
+) -> Option<Vec<WaylandMessage>> {
+    catch_unwind(AssertUnwindSafe(|| session.lower(protocol))).ok()
 }
 
 fn substitute_object_arg_same_interface_in_session<S: HasRand>(
@@ -325,6 +357,20 @@ mod tests {
   </interface>
 </protocol>"#;
 
+    const MINI_XML_WITH_STRING_ARG: &str = r#"<?xml version="1.0"?>
+<protocol name="mini_string">
+  <interface name="wl_display" version="1">
+    <request name="make_child">
+      <arg name="id" type="new_id" interface="wl_child"/>
+    </request>
+  </interface>
+  <interface name="wl_child" version="1">
+    <request name="set_title">
+      <arg name="title" type="string"/>
+    </request>
+  </interface>
+</protocol>"#;
+
     fn mk_message(timestamp_us: u64, object_id: u32, opcode: u16) -> WaylandMessage {
         WaylandMessage {
             timestamp_us,
@@ -398,6 +444,12 @@ mod tests {
     fn protocol() -> Protocol {
         let mut protocol = Protocol::new();
         protocol.load_str(MINI_XML).unwrap();
+        protocol
+    }
+
+    fn protocol_with_string_arg() -> Protocol {
+        let mut protocol = Protocol::new();
+        protocol.load_str(MINI_XML_WITH_STRING_ARG).unwrap();
         protocol
     }
 
@@ -677,5 +729,166 @@ mod tests {
         let result = substitute_object_arg_same_interface_in_session(&mut state, &mut session);
 
         assert!(matches!(result, MutationResult::Skipped));
+    }
+
+    #[test]
+    fn semantic_receiver_substitution_skips_when_any_message_has_fds() {
+        let mut input = mk_semantic_input_for_receiver_substitution();
+        input.messages[0].fds = vec![FdRecord {
+            fd_num: 11,
+            fd_type: FdType::Shm,
+            seekable: true,
+            truncated: false,
+            format_hint: 0,
+            original_size: 1,
+            content: vec![0],
+        }];
+        let before = input.to_wlir_bytes();
+        let mut state = mk_state(0xCAFE);
+
+        let result = substitute_receiver_same_interface(&mut state, &mut input, &protocol());
+
+        assert!(matches!(result, MutationResult::Skipped));
+        assert_eq!(input.to_wlir_bytes(), before);
+    }
+
+    #[test]
+    fn semantic_object_argument_substitution_skips_when_any_message_has_fds() {
+        let mut input = WlirInput {
+            header: mk_input().header,
+            messages: vec![
+                WaylandMessage {
+                    timestamp_us: 10,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 20,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 30,
+                    instance_id: 0,
+                    object_id: 2,
+                    opcode: 1,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        2u32.to_le_bytes().as_slice(),
+                        1u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: vec![FdUpdateRecord {
+                        object_id: 2,
+                        new_size: 4,
+                        content: vec![1, 2, 3, 4],
+                    }],
+                    decoded_args: Vec::new(),
+                },
+            ],
+        };
+        let before = input.to_wlir_bytes();
+        let mut state = mk_state(0xD00D);
+
+        let result = substitute_object_arg_same_interface(&mut state, &mut input, &protocol());
+
+        assert!(matches!(result, MutationResult::Skipped));
+        assert_eq!(input.to_wlir_bytes(), before);
+    }
+
+    #[test]
+    fn semantic_receiver_substitution_skips_when_lowering_panics_for_string_args() {
+        let mut input = WlirInput {
+            header: mk_input().header,
+            messages: vec![
+                WaylandMessage {
+                    timestamp_us: 10,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 20,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 30,
+                    instance_id: 0,
+                    object_id: 2,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        2u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (16u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                        b"hi\0\0",
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+            ],
+        };
+        let before = input.to_wlir_bytes();
+        let mut state = mk_state(0xFACE);
+
+        let result =
+            substitute_receiver_same_interface(&mut state, &mut input, &protocol_with_string_arg());
+
+        assert!(matches!(result, MutationResult::Skipped));
+        assert_eq!(input.to_wlir_bytes(), before);
     }
 }
