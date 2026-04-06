@@ -76,7 +76,7 @@ use wl_repeater::message::WaylandMessage;
 
 use crate::{
     config::{load_runtime_config, parse_config_path},
-    differential::{DifferentialExecutor, DifferentialOutcome},
+    differential::{load_protocols, DifferentialExecutor, DifferentialOutcome},
     wlir_input::WlirInput,
     wlir_mutator::WlirMutator,
 };
@@ -508,7 +508,14 @@ fn main() -> ExitCode {
     //
     // TODO(later): add protocol-semantic argument-aware mutations once message
     // decoding/validation hooks are integrated into the mutator.
-    let mutator = WlirMutator;
+    let mutator_protocol = match load_protocols(&runtime_config.replay.protocol_dirs) {
+        Ok(protocol) => protocol,
+        Err(err) => {
+            eprintln!("failed to load protocols for mutator: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mutator = WlirMutator::new(mutator_protocol);
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
     // let mut stages = tuple_list!();
     // let mut stages = ();

@@ -7,7 +7,11 @@ use libafl::{
     Error,
 };
 use libafl_bolts::{rands::Rand, Named};
-use wl_repeater::message::WaylandMessage;
+use wl_repeater::{
+    message::WaylandMessage,
+    protocol::Protocol,
+    symbolic::{MessageBody, SymbolicSession, Value},
+};
 
 use crate::wlir_input::WlirInput;
 
@@ -15,7 +19,15 @@ const MAX_TIMESTAMP_JITTER_US: u64 = 5_000;
 const MAX_OBJECT_ID_DELTA: u32 = 8;
 const MAX_OPCODE_DELTA: u16 = 4;
 
-pub struct WlirMutator;
+pub struct WlirMutator {
+    protocol: Protocol,
+}
+
+impl WlirMutator {
+    pub fn new(protocol: Protocol) -> Self {
+        Self { protocol }
+    }
+}
 
 impl Named for WlirMutator {
     fn name(&self) -> &Cow<'static, str> {
@@ -30,6 +42,8 @@ where
 {
     fn mutate(&mut self, state: &mut S, input: &mut WlirInput) -> Result<MutationResult, Error> {
         let mut available_ops = vec![
+            MutationOp::ReceiverSubstitution,
+            MutationOp::ObjectArgSubstitution,
             MutationOp::Duplicate,
             MutationOp::TimestampJitter,
         ];
@@ -49,6 +63,12 @@ where
         let op = available_ops[idx];
 
         let result = match op {
+            MutationOp::ReceiverSubstitution => {
+                substitute_receiver_same_interface(state, input, &self.protocol)
+            }
+            MutationOp::ObjectArgSubstitution => {
+                substitute_object_arg_same_interface(state, input, &self.protocol)
+            }
             MutationOp::RemoveOne => remove_one_message(state, input),
             MutationOp::Duplicate => duplicate_one_message(state, input),
             MutationOp::SwapAdjacent => swap_adjacent_messages(state, input),
@@ -65,6 +85,8 @@ where
 
 #[derive(Clone, Copy)]
 enum MutationOp {
+    ReceiverSubstitution,
+    ObjectArgSubstitution,
     RemoveOne,
     Duplicate,
     SwapAdjacent,
@@ -143,6 +165,106 @@ pub(crate) fn jitter_timestamp_bounded<S: HasRand>(
     MutationResult::Mutated
 }
 
+pub(crate) fn substitute_receiver_same_interface<S: HasRand>(
+    state: &mut S,
+    input: &mut WlirInput,
+    protocol: &Protocol,
+) -> MutationResult {
+    let mut session = SymbolicSession::import(&input.header, &input.messages, protocol);
+    let semantic_indexes: Vec<_> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match &message.body {
+            MessageBody::Semantic(call) => {
+                Some((index, message.receiver, call.interface, message.id))
+            }
+            MessageBody::Raw(_) => None,
+        })
+        .collect();
+
+    for (index, receiver, interface, message_id) in semantic_indexes {
+        let alternatives: Vec<_> = session
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.id != receiver
+                    && symbol.interface == interface
+                    && symbol.is_live_at(message_id)
+            })
+            .map(|symbol| symbol.id)
+            .collect();
+        if alternatives.is_empty() {
+            continue;
+        }
+        let choice = state
+            .rand_mut()
+            .below(NonZeroUsize::new(alternatives.len()).unwrap());
+        session.messages[index].receiver = alternatives[choice];
+        input.messages = session.lower(protocol);
+        return MutationResult::Mutated;
+    }
+
+    MutationResult::Skipped
+}
+
+pub(crate) fn substitute_object_arg_same_interface<S: HasRand>(
+    state: &mut S,
+    input: &mut WlirInput,
+    protocol: &Protocol,
+) -> MutationResult {
+    let mut session = SymbolicSession::import(&input.header, &input.messages, protocol);
+
+    for message_index in 0..session.messages.len() {
+        let (message_id, object_args): (u32, Vec<(usize, u32)>) =
+            match &session.messages[message_index].body {
+                MessageBody::Semantic(call) => (
+                    session.messages[message_index].id,
+                    call.args
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(arg_index, arg)| match &arg.value {
+                            Value::Object(current) => Some((arg_index, *current)),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                MessageBody::Raw(_) => continue,
+            };
+
+        for (arg_index, current) in object_args {
+            let current_interface = session.symbols[current as usize].interface;
+            let alternatives: Vec<_> = session
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.id != current
+                        && symbol.interface == current_interface
+                        && symbol.is_live_at(message_id)
+                })
+                .map(|symbol| symbol.id)
+                .collect();
+            if alternatives.is_empty() {
+                continue;
+            }
+
+            let choice = state
+                .rand_mut()
+                .below(NonZeroUsize::new(alternatives.len()).unwrap());
+            let replacement = alternatives[choice];
+
+            if let MessageBody::Semantic(call) = &mut session.messages[message_index].body {
+                call.args[arg_index].value = Value::Object(replacement);
+            }
+
+            input.messages = session.lower(protocol);
+            return MutationResult::Mutated;
+        }
+    }
+
+    MutationResult::Skipped
+}
+
 fn sync_wire_header(message: &mut WaylandMessage) {
     if message.wire_data.len() >= 4 {
         message.wire_data[0..4].copy_from_slice(&message.object_id.to_le_bytes());
@@ -164,10 +286,26 @@ fn sync_wire_header(message: &mut WaylandMessage) {
 mod tests {
     use super::*;
     use libafl_bolts::rands::StdRand;
+    use wl_repeater::protocol::Protocol;
     use wl_repeater::{
         ir::IrFileHeader,
         message::{Direction, FdRecord, FdType, FdUpdateRecord},
     };
+
+    const MINI_XML: &str = r#"<?xml version="1.0"?>
+<protocol name="mini">
+  <interface name="wl_display" version="1">
+    <request name="make_child">
+      <arg name="id" type="new_id" interface="wl_child"/>
+    </request>
+  </interface>
+  <interface name="wl_child" version="1">
+    <request name="ping"/>
+    <request name="link">
+      <arg name="peer" type="object" interface="wl_child"/>
+    </request>
+  </interface>
+</protocol>"#;
 
     fn mk_message(timestamp_us: u64, object_id: u32, opcode: u16) -> WaylandMessage {
         WaylandMessage {
@@ -236,6 +374,76 @@ mod tests {
     fn mk_state(seed: u64) -> TestRandState {
         TestRandState {
             rand: StdRand::with_seed(seed),
+        }
+    }
+
+    fn protocol() -> Protocol {
+        let mut protocol = Protocol::new();
+        protocol.load_str(MINI_XML).unwrap();
+        protocol
+    }
+
+    fn mk_semantic_input_for_receiver_substitution() -> WlirInput {
+        WlirInput {
+            header: IrFileHeader {
+                magic: 0x574C_4952,
+                version: 2,
+                start_time_us: 10,
+                flags: 0,
+                reserved: 0,
+            },
+            messages: vec![
+                WaylandMessage {
+                    timestamp_us: 10,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 20,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 30,
+                    instance_id: 0,
+                    object_id: 2,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        2u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (8u16).to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+            ],
         }
     }
 
@@ -319,5 +527,83 @@ mod tests {
             }
         }
         assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn semantic_receiver_substitution_rewrites_header_object_id() {
+        let mut input = mk_semantic_input_for_receiver_substitution();
+        let mut state = mk_state(0x9999);
+
+        let result = substitute_receiver_same_interface(&mut state, &mut input, &protocol());
+
+        assert!(matches!(result, MutationResult::Mutated));
+        assert_eq!(input.messages[2].object_id, 3);
+        assert_eq!(&input.messages[2].wire_data[0..4], &3u32.to_le_bytes());
+    }
+
+    #[test]
+    fn semantic_object_argument_substitution_rewrites_argument_payload() {
+        let mut input = WlirInput {
+            header: mk_input().header,
+            messages: vec![
+                WaylandMessage {
+                    timestamp_us: 10,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 20,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 30,
+                    instance_id: 0,
+                    object_id: 2,
+                    opcode: 1,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        2u32.to_le_bytes().as_slice(),
+                        1u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        3u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+            ],
+        };
+        let mut state = mk_state(0xABCD);
+
+        let result = substitute_object_arg_same_interface(&mut state, &mut input, &protocol());
+
+        assert!(matches!(result, MutationResult::Mutated));
+        assert_eq!(&input.messages[2].wire_data[8..12], &2u32.to_le_bytes());
     }
 }
