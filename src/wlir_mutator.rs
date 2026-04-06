@@ -215,6 +215,18 @@ pub(crate) fn substitute_object_arg_same_interface<S: HasRand>(
 ) -> MutationResult {
     let mut session = SymbolicSession::import(&input.header, &input.messages, protocol);
 
+    let result = substitute_object_arg_same_interface_in_session(state, &mut session);
+    if matches!(result, MutationResult::Mutated) {
+        input.messages = session.lower(protocol);
+    }
+
+    result
+}
+
+fn substitute_object_arg_same_interface_in_session<S: HasRand>(
+    state: &mut S,
+    session: &mut SymbolicSession,
+) -> MutationResult {
     for message_index in 0..session.messages.len() {
         let (message_id, object_args): (u32, Vec<(usize, u32)>) =
             match &session.messages[message_index].body {
@@ -233,7 +245,14 @@ pub(crate) fn substitute_object_arg_same_interface<S: HasRand>(
             };
 
         for (arg_index, current) in object_args {
-            let current_interface = session.symbols[current as usize].interface;
+            let Some(current_interface) = session
+                .symbols
+                .iter()
+                .find(|symbol| symbol.id == current)
+                .map(|symbol| symbol.interface)
+            else {
+                continue;
+            };
             let alternatives: Vec<_> = session
                 .symbols
                 .iter()
@@ -257,7 +276,6 @@ pub(crate) fn substitute_object_arg_same_interface<S: HasRand>(
                 call.args[arg_index].value = Value::Object(replacement);
             }
 
-            input.messages = session.lower(protocol);
             return MutationResult::Mutated;
         }
     }
@@ -605,5 +623,59 @@ mod tests {
 
         assert!(matches!(result, MutationResult::Mutated));
         assert_eq!(&input.messages[2].wire_data[8..12], &2u32.to_le_bytes());
+    }
+
+    #[test]
+    fn semantic_object_argument_substitution_skips_stale_symbolic_reference() {
+        let input = WlirInput {
+            header: mk_input().header,
+            messages: vec![
+                WaylandMessage {
+                    timestamp_us: 10,
+                    instance_id: 0,
+                    object_id: 1,
+                    opcode: 0,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        1u32.to_le_bytes().as_slice(),
+                        0u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+                WaylandMessage {
+                    timestamp_us: 20,
+                    instance_id: 0,
+                    object_id: 2,
+                    opcode: 1,
+                    direction: Direction::ClientToServer,
+                    wire_data: [
+                        2u32.to_le_bytes().as_slice(),
+                        1u16.to_le_bytes().as_slice(),
+                        (12u16).to_le_bytes().as_slice(),
+                        2u32.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                    fds: Vec::new(),
+                    fd_updates: Vec::new(),
+                    decoded_args: Vec::new(),
+                },
+            ],
+        };
+        let mut state = mk_state(0xBEEF);
+        let protocol = protocol();
+        let mut session = SymbolicSession::import(&input.header, &input.messages, &protocol);
+
+        if let MessageBody::Semantic(call) = &mut session.messages[1].body {
+            call.args[0].value = Value::Object(u32::MAX);
+        }
+
+        let result = substitute_object_arg_same_interface_in_session(&mut state, &mut session);
+
+        assert!(matches!(result, MutationResult::Skipped));
     }
 }
